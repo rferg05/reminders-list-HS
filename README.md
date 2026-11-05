@@ -24,7 +24,8 @@ The lists live in **Radicale**, a small CalDAV server on the same Pi as Home Scr
 - **Subtasks** indented under their parent, when the phone sends them.
 - **Order:** the order items are dragged into on the phones (the default), or due soonest first with undated ones last.
 - **Checked-off items** disappear at once, or stay at the bottom crossed out for up to 48 hours (*Keep checked-off items for*), so everyone can see what got done.
-- **Fitting:** text is sized from the Style panel's Text size, times *Text size*. Lists flow down a column and on into the next. With *Columns* on Auto, a second or third column is used only when one column won't hold everything. Whatever still doesn't fit is cut from the longest list first, each ending "+3 more", so one long list can't push the others off. A list's heading never sits alone at the bottom of a column.
+- **Sized for across the room:** with *Scale with module size* on (the default), text, rings and rules grow with the module's area against its default 520×640 size, as in the CTA and Travel modules, then up to 2.2× larger still while every item fits. A short list on a big module gets very large type. A long one shrinks it, to no less than 0.6× the scaled size and never below the Style panel's Text size, before anything is cut. *Text size* applies on top.
+- **Fitting:** lists flow down a column and on into the next. With *Columns* on Auto, at each text size a second or third column is tried before smaller text, while each column stays wide enough to read. Whatever still doesn't fit at the smallest size is cut from the longest list first, each ending "+3 more", so one long list can't push the others off. A list's heading never sits alone at the bottom of a column.
 - **Headings:** each list's name and how many are left to do. Empty lists say *All done*, or can be hidden.
 - **Offline:** if Radicale stops answering, the last copy stays up with "Not updated since 3:42p" beside the heading. It survives a page reload.
 
@@ -112,6 +113,7 @@ CalDAV carries the basics: titles, notes, due dates and times, priority, complet
 | Keep checked-off items for | 0 hours | Up to 48. |
 | When the list is empty, show | All done | |
 | Text size | 1× | 0.5–2.5×, on top of the Style panel's Text size. |
+| Scale with module size | on | Grow text with the module, as the CTA and Travel modules do. Off sizes everything from Text size alone. |
 | Accent color | amber | Rings, heading underline, priority marks, due today. |
 | Clock times | Household setting | Or 12-hour (5p, 5:30p) or 24-hour. |
 

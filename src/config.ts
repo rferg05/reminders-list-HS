@@ -19,6 +19,7 @@ export interface Config {
   keepDoneHours: number;
   columns: Columns;
   textScale: number;
+  scaleWithSize: boolean;
   accentColor: string;
   emptyText: string;
   timeFormat: TimeFormatSetting;
@@ -55,6 +56,7 @@ export function readConfig(raw: Record<string, unknown>): Config {
     keepDoneHours: num(raw.keepDoneHours, 0, 0, 48),
     columns: pick(raw.columns, ['auto', '1', '2', '3'] as const, 'auto'),
     textScale: num(raw.textScale, 1, 0.5, 2.5),
+    scaleWithSize: bool(raw.scaleWithSize, true),
     accentColor: str(raw.accentColor, '#f59e0b'),
     emptyText: str(raw.emptyText, 'All done'),
     timeFormat: pick(raw.timeFormat, ['auto', '12h', '24h'] as const, 'auto'),
