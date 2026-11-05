@@ -5,7 +5,10 @@
 #     any phone shows up on all of them
 #   - one read-only "display" account for the Reminders List module
 #   - a list called Household, ready to use
-#   - LAN only, plain HTTP on port 5232
+#   - LAN only: HTTPS on port 5443 for the phones (current iOS won't send a
+#     CalDAV password over plain HTTP), plain HTTP on 5232 for the dashboard
+#   - a certificate authority of its own, which phones install once to trust
+#     the Pi's HTTPS certificate
 #   - radicale-lists, a small helper on port 5233 that lets the module find
 #     every list in the family account (see the note at its section)
 #
@@ -14,16 +17,19 @@
 #   sudo bash install-radicale.sh --list "Groceries"     # name of the starter list
 #   sudo bash install-radicale.sh --reset-passwords      # pick new passwords
 #
-# Re-running is safe: it keeps existing passwords and lists, and rewrites only
+# Re-running is safe: it keeps existing passwords, lists and the certificate
+# authority, renews the Pi's certificate when it's due, and rewrites only
 # Radicale's config and rights files (backing up the old ones first) and the
 # helper.
 
 set -euo pipefail
 
 PORT=5232
+HTTPS_PORT=5443
 HELPER_PORT=$((PORT + 1))   # the module looks for it on Radicale's port plus one
 HELPER_DIR="/opt/radicale-lists"
 CONF_DIR="/etc/radicale"
+TLS_DIR="$CONF_DIR/tls"
 USERS_FILE="$CONF_DIR/users"
 RIGHTS_FILE="$CONF_DIR/rights"
 STORAGE="/var/lib/radicale/collections"
@@ -42,7 +48,7 @@ warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -71,7 +77,7 @@ PI_IP="$(hostname -I | awk '{print $1}')"
 
 step "Installing Radicale"
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq radicale apache2-utils python3-bcrypt curl >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq radicale apache2-utils python3-bcrypt curl openssl >/dev/null
 bold "$(radicale --version 2>/dev/null | tail -n1 | sed 's/^/Radicale /')"
 
 # ── Accounts ─────────────────────────────────────────────────────────────────
@@ -251,6 +257,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 RADICALE = os.environ.get("RADICALE_URL", "http://127.0.0.1:5232").rstrip("/")
 HOST = os.environ.get("LISTS_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LISTS_PORT", "5233"))
+# The Pi's certificate authority, for phones to install (public, no key).
+CA_CERT = os.environ.get("CA_CERT", "/etc/radicale/tls/ca.crt")
 
 BODY = (
     '<?xml version="1.0" encoding="utf-8"?>'
@@ -268,6 +276,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path == "/ca.crt":
+            try:
+                with open(CA_CERT, "rb") as f:
+                    return self.reply(200, f.read(), "application/x-x509-ca-cert")
+            except OSError:
+                return self.reply(404, b"No certificate yet: re-run install-radicale.sh\n", "text/plain")
         if not ACCOUNT.match(path):
             return self.reply(404, b"Ask for an account, like /family/\n", "text/plain")
         headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
@@ -309,6 +323,7 @@ Wants=network-online.target
 [Service]
 Environment=RADICALE_URL=http://127.0.0.1:$PORT
 Environment=LISTS_PORT=$HELPER_PORT
+Environment=CA_CERT=$TLS_DIR/ca.crt
 ExecStart=/usr/bin/python3 $HELPER_DIR/radicale-lists.py
 Restart=always
 RestartSec=5
@@ -326,6 +341,107 @@ for _ in $(seq 1 20); do
 done
 curl -s -o /dev/null "http://127.0.0.1:$HELPER_PORT/" || die "radicale-lists didn't start. See: sudo journalctl -u radicale-lists -n 50"
 echo "Listening on port $HELPER_PORT."
+
+# ── HTTPS for the phones ─────────────────────────────────────────────────────
+# Current iOS won't send a CalDAV password over plain HTTP, so phones use a
+# second Radicale process on port 5443 with TLS. It reads the same config and
+# lists (Radicale locks its storage, so two processes can share it); only the
+# port and the certificate differ. The dashboard keeps plain HTTP on 5232,
+# inside the Pi.
+#
+# The certificate is signed by a certificate authority made here, once. A
+# phone installs that authority (downloaded from the helper at /ca.crt) and
+# from then on trusts the Pi. The Pi's own certificate lasts 825 days, the
+# longest iOS accepts; re-running renews it, under the same authority, so the
+# phones don't need to do anything again.
+
+step "Setting up HTTPS for the phones"
+HOST_NAME="$(hostname)"
+mkdir -p "$TLS_DIR"
+chmod 755 "$TLS_DIR"
+NEW_CA=0
+if [[ ! -s "$TLS_DIR/ca.key" || ! -s "$TLS_DIR/ca.crt" ]]; then
+  openssl req -x509 -new -nodes -newkey rsa:2048 -sha256 -days 3650 \
+    -keyout "$TLS_DIR/ca.key" -out "$TLS_DIR/ca.crt" \
+    -subj "/CN=Home Screens Radicale ($HOST_NAME)" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null \
+    || die "Couldn't make the certificate authority (openssl failed)."
+  NEW_CA=1
+  echo "Made a certificate authority for this Pi."
+fi
+chmod 600 "$TLS_DIR/ca.key"
+chmod 644 "$TLS_DIR/ca.crt"
+
+# A new certificate when there's none, it expires within 30 days, the Pi's
+# address changed, or the authority is new.
+cert_ok() {
+  [[ -s "$TLS_DIR/server.crt" && -s "$TLS_DIR/server.key" ]] || return 1
+  openssl x509 -checkend $((30 * 86400)) -noout -in "$TLS_DIR/server.crt" >/dev/null 2>&1 || return 1
+  openssl x509 -noout -text -in "$TLS_DIR/server.crt" 2>/dev/null | grep -Eq "IP Address:${PI_IP//./\\.}(,|$)" || return 1
+  openssl verify -CAfile "$TLS_DIR/ca.crt" "$TLS_DIR/server.crt" >/dev/null 2>&1 || return 1
+}
+if [[ $NEW_CA -eq 1 ]] || ! cert_ok; then
+  WORK="$(mktemp -d)"
+  cat > "$WORK/ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=IP:$PI_IP,DNS:$HOST_NAME,DNS:$HOST_NAME.local
+EOF
+  openssl req -new -nodes -newkey rsa:2048 -keyout "$TLS_DIR/server.key" -out "$WORK/csr" \
+    -subj "/CN=$PI_IP" 2>/dev/null \
+    && openssl x509 -req -in "$WORK/csr" -CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" \
+      -CAcreateserial -CAserial "$TLS_DIR/ca.srl" -out "$TLS_DIR/server.crt" \
+      -days 825 -sha256 -extfile "$WORK/ext" 2>/dev/null \
+    || die "Couldn't make the Pi's certificate (openssl failed)."
+  rm -rf "$WORK"
+  echo "Made a certificate for $PI_IP, good for 825 days."
+else
+  echo "The Pi's certificate is current."
+fi
+chown root:radicale "$TLS_DIR/server.key"
+chmod 640 "$TLS_DIR/server.key"
+chmod 644 "$TLS_DIR/server.crt"
+
+cat > "$CONF_DIR/config-https" <<EOF
+# Written by install-radicale.sh. Read after $CONF_DIR/config by
+# radicale-https: the same Radicale and lists, over HTTPS for the phones.
+[server]
+hosts = 0.0.0.0:$HTTPS_PORT, [::]:$HTTPS_PORT
+ssl = True
+certificate = $TLS_DIR/server.crt
+key = $TLS_DIR/server.key
+EOF
+chown root:radicale "$CONF_DIR/config-https"
+chmod 640 "$CONF_DIR/config-https"
+
+cat > /etc/systemd/system/radicale-https.service <<EOF
+[Unit]
+Description=Radicale over HTTPS for the iPhones (Home Screens reminders)
+After=network-online.target radicale.service
+Wants=network-online.target
+
+[Service]
+User=radicale
+Group=radicale
+ExecStart=/usr/bin/python3 -m radicale --config $CONF_DIR/config:$CONF_DIR/config-https
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable radicale-https >/dev/null 2>&1
+systemctl restart radicale-https
+for _ in $(seq 1 20); do
+  curl -s -o /dev/null --cacert "$TLS_DIR/ca.crt" "https://$PI_IP:$HTTPS_PORT/" && break
+  sleep 0.5
+done
+curl -s -o /dev/null --cacert "$TLS_DIR/ca.crt" "https://$PI_IP:$HTTPS_PORT/" \
+  || die "Radicale over HTTPS didn't answer on port $HTTPS_PORT. See: sudo journalctl -u radicale-https -n 50"
+echo "Listening on port $HTTPS_PORT, with a certificate the phones can check."
 
 # ── The starter list ─────────────────────────────────────────────────────────
 
@@ -381,22 +497,28 @@ fi
 
 DISPLAY_LINE="Password:     ${DISPLAY_PASSWORD:-(unchanged; see the earlier copy of this file, or re-run with --reset-passwords)}"
 cat > "$NOTES" <<EOF
-Radicale is running at http://$PI_IP:$PORT/  (web page: http://$PI_IP:$PORT/.web/)
+Radicale is running at https://$PI_IP:$HTTPS_PORT/ for the phones
+(web page: https://$PI_IP:$HTTPS_PORT/.web/) and http://$PI_IP:$PORT/ for the dashboard.
 
-1. On each iPhone (on the home Wi-Fi)
+1. On each iPhone (on the home Wi-Fi), once: trust the Pi's certificate
+   a. In Safari, open  http://$PI_IP:$HELPER_PORT/ca.crt  and tap Allow.
+   b. Settings > General > VPN & Device Management > "Home Screens Radicale
+      ($HOST_NAME)" > Install, and enter the phone's passcode.
+   c. Settings > General > About > Certificate Trust Settings: turn on
+      "Home Screens Radicale ($HOST_NAME)".
+
+2. On each iPhone, add the account
    Settings > Apps > Reminders > Reminders Accounts > Add Account > Other
    > Add CalDAV Account
-     Server:       $PI_IP:$PORT
+     Server:       $PI_IP:$HTTPS_PORT
      User Name:    $FAMILY_USER
      Password:     the family password you chose
      Description:  Home
-   Tap Next. When it says it can't connect using SSL, tap Continue.
-   If it still fails: tap Advanced Settings, turn Use SSL off, set Port to
-   $PORT, and set Account URL to http://$PI_IP:$PORT/$FAMILY_USER/
-   On the next page turn Reminders on (and Calendars off).
-   The "$LIST_NAME" list appears in Reminders under "Home".
+   Tap Next (leave Use SSL on). On the next page turn Reminders on (and
+   Calendars off). The "$LIST_NAME" list appears in Reminders under "Home".
+   An old Home account on port $PORT: delete it first.
 
-2. In the Home Screens editor, add a Reminders List module and set
+3. In the Home Screens editor, add a Reminders List module and set
      Address:      $ACCOUNT_URL   (every list under Home)
                    or $LIST_URL   (just $LIST_NAME)
      User name:    $DISPLAY_USER

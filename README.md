@@ -5,12 +5,13 @@ Home Screens module: shared to-do lists that everyone edits in the **iPhone Remi
 The lists live in **Radicale**, a small CalDAV server on the same Pi as Home Screens. Each iPhone adds it as a Reminders account, so the shared lists sit next to everyone's own: add "Milk" with Siri or check something off in the store, and the wall shows it within a minute. A list someone makes on their phone under Home shows up on the wall by itself.
 
 ```
- iPhones ──(Reminders app, CalDAV, home Wi-Fi)──▶ Radicale on the Pi :5232
-                                                       │
- Home Screens display ◀──(read-only account)───────────┘
+ iPhones ──(Reminders app, CalDAV over HTTPS, home Wi-Fi)──▶ Radicale on the Pi :5443
+                                                                  │ same lists
+ Home Screens display ◀──(read-only account, HTTP)──────── Radicale on the Pi :5232
 ```
 
 - **Home Wi-Fi only.** Radicale listens on the LAN, not the internet. Changes made away from home wait on the phone and sync the next time it's on the home Wi-Fi.
+- **HTTPS for the phones.** Current iOS won't send a CalDAV password over plain HTTP: it asks without one and gives up ("CalDAV account verification failed"). So phones use a second Radicale process on port 5443 with a certificate from a small certificate authority the installer makes. Each phone installs that authority once. The dashboard stays on plain HTTP on port 5232, inside the Pi.
 - **Display only.** The module shows the list; the phones do all the editing. Its account can read lists but not change them.
 - **Finding lists.** Listing an account's lists takes a CalDAV PROPFIND. Home Screens' proxy only passes GET, POST, PUT and PATCH, and its pages may not call Radicale's address directly. So the installer adds **radicale-lists**, a small Python helper on port 5233 (Radicale's port plus one) that answers a GET on `/family/` by asking Radicale on the module's behalf. It holds no passwords: the module's own login is passed on. Each list is then read through the proxy with a plain GET.
 - **Light.** Radicale is one Python process using about 30 MB of memory, with the list kept as plain files in `/var/lib/radicale/collections`.
@@ -41,26 +42,32 @@ curl -fsSLO https://raw.githubusercontent.com/rferg05/reminders-list-HS/main/ins
 sudo bash install-radicale.sh
 ```
 
-It asks for a password for the **family** account, the one every iPhone signs in to. Then it installs Radicale from Raspberry Pi OS's own packages, makes a read-only **display** account for the dashboard, creates a list called **Household**, and starts Radicale on port **5232**. At the end it prints what to enter on the phones and in the module, and saves that to `/etc/radicale/NEXT-STEPS.txt`.
+It asks for a password for the **family** account, the one every iPhone signs in to. Then it installs Radicale from Raspberry Pi OS's own packages, makes a read-only **display** account for the dashboard, creates a list called **Household**, and starts Radicale on port **5232** for the dashboard and **5443** (HTTPS) for the phones. At the end it prints what to enter on the phones and in the module, and saves that to `/etc/radicale/NEXT-STEPS.txt`.
 
-`--list "Groceries"` names the starter list something else. Re-running is safe: it keeps the passwords and lists. `--reset-passwords` picks new ones.
+`--list "Groceries"` names the starter list something else. Re-running is safe: it keeps the passwords, lists and certificate authority. `--reset-passwords` picks new ones. The Pi's certificate lasts 825 days, the longest iOS accepts; re-running the installer renews it (and does so whenever the Pi's address changes), and phones keep trusting it without doing anything.
 
-**Installed before 1.2.0?** Download the installer again and re-run it to add radicale-lists, which the module needs to find every list. Your passwords and lists stay as they are.
+**Installed an earlier version?** Download the installer again and re-run it: it adds radicale-lists (the module needs it to find every list) and HTTPS for the phones. Your passwords and lists stay as they are.
 
 Give the Pi a fixed address in your router's DHCP settings (a "reservation") so the phones keep finding it. The examples here use `192.168.1.14`.
 
 ### 2. Add the list to each iPhone
 
-On the home Wi-Fi: **Settings > Apps > Reminders > Reminders Accounts > Add Account > Other > Add CalDAV Account**.
+On the home Wi-Fi, first make the phone trust the Pi's certificate (once per phone):
+
+1. In Safari, open `http://192.168.1.14:5233/ca.crt` and tap **Allow**.
+2. **Settings > General > VPN & Device Management**, tap **Home Screens Radicale (…)**, then **Install**, and enter the phone's passcode.
+3. **Settings > General > About > Certificate Trust Settings**: turn on **Home Screens Radicale (…)**.
+
+Then **Settings > Apps > Reminders > Reminders Accounts > Add Account > Other > Add CalDAV Account**:
 
 | Field | Value |
 |---|---|
-| Server | `192.168.1.14:5232` |
+| Server | `192.168.1.14:5443` |
 | User Name | `family` (capitals don't matter) |
 | Password | the family password |
 | Description | `Home` |
 
-Tap **Next**. When it says it can't connect using SSL, tap **Continue**. If it still fails, open **Advanced Settings**: turn **Use SSL** off, set **Port** to `5232` and **Account URL** to `http://192.168.1.14:5232/family/`. On the last page turn **Reminders** on and **Calendars** off.
+Tap **Next**, leaving **Use SSL** on. On the last page turn **Reminders** on and **Calendars** off. If an older Home account points at port 5232, delete it first: lists made in it only exist on that phone.
 
 The Household list shows up in Reminders under **Home**. Lists anyone makes under Home are shared with every phone too. To make Siri use the shared list, name it: "Add milk to the Household list".
 
@@ -119,6 +126,8 @@ CalDAV carries the basics: titles, notes, due dates and times, priority, complet
 | This account can't read that list | The list belongs to an account other than `family`. |
 | Nothing at that address | Check the address; the family account's is `http://<pi>:5232/family/`. |
 | None of those lists were found | The names in *Only these lists* don't match the phones'. |
+
+**"CalDAV account verification failed" on a phone:** check that the Server is `192.168.1.14:5443` (with the port) and the certificate is trusted (step 2). On the Pi, `sudo journalctl -u radicale-https --since "5 min ago"` shows the phone's requests: "denied for anonymous user" means it sent no password (still on plain HTTP, or an empty Password field); "Failed login attempt" means the password is wrong.
 
 If a phone stops syncing: **Settings > Apps > Reminders > Reminders Accounts > Home**, and check the account is on and the password is current.
 
