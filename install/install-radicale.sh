@@ -119,6 +119,14 @@ chmod 640 "$USERS_FILE"
 backup() { [[ -f "$1" ]] && cp -a "$1" "$1.bak.$(date +%Y%m%d-%H%M%S)" || true; }
 
 step "Writing $CONF_DIR/config and rights"
+# Phones capitalize the first letter of a user name ("Family"). Radicale can
+# lowercase names before checking them, if this version has the option.
+LC_USERNAME=""
+if python3 -c 'import sys, radicale.config as c; sys.exit(0 if "lc_username" in dict(c.DEFAULT_CONFIG_SCHEMA["auth"]) else 1)' 2>/dev/null; then
+  LC_USERNAME="lc_username = True"
+else
+  warn "This Radicale can't ignore case in user names: type them in lowercase."
+fi
 backup "$CONF_DIR/config"
 cat > "$CONF_DIR/config" <<EOF
 # Written by install-radicale.sh. LAN only: phones and the Home Screens
@@ -132,6 +140,8 @@ htpasswd_filename = $USERS_FILE
 htpasswd_encryption = bcrypt
 # Slow down password guessing from the LAN.
 delay = 1
+# "Family" and "family" are the same user.
+$LC_USERNAME
 
 [rights]
 type = from_file

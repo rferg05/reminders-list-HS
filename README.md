@@ -56,7 +56,7 @@ On the home Wi-Fi: **Settings > Apps > Reminders > Reminders Accounts > Add Acco
 | Field | Value |
 |---|---|
 | Server | `192.168.1.14:5232` |
-| User Name | `family` |
+| User Name | `family` (capitals don't matter) |
 | Password | the family password |
 | Description | `Home` |
 
