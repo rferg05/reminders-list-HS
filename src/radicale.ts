@@ -97,7 +97,7 @@ export type Failure =
   | { kind: 'forbidden' } // the account may not read this list
   | { kind: 'notFound' } // no list at that address
   | { kind: 'notAList' } // an answer, but not an iCalendar file
-  | { kind: 'cantList' } // the browser couldn't ask Radicale for the account's lists (no CORS headers, or unreachable)
+  | { kind: 'cantList' } // no answer from the radicale-lists helper (not installed, or stopped)
   | { kind: 'unexpected'; status: number };
 
 export class ListError extends Error {
@@ -106,7 +106,7 @@ export class ListError extends Error {
   }
 }
 
-function failureOf(a: ProxyAnswer): Failure {
+export function failureOf(a: ProxyAnswer): Failure {
   const text = a.body.slice(0, 500);
   // The host proxy answers 403 for its own refusals, with a JSON reason.
   if (/allowedDomains|blocked address|not installed|manifest not found|not allowed|localNetwork/i.test(text)) {

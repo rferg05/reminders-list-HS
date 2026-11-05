@@ -6,7 +6,8 @@
 #   - one read-only "display" account for the Reminders List module
 #   - a list called Household, ready to use
 #   - LAN only, plain HTTP on port 5232
-#   - CORS headers, so the module can find every list in the family account
+#   - radicale-lists, a small helper on port 5233 that lets the module find
+#     every list in the family account (see the note at its section)
 #
 # Usage (on the Pi):
 #   sudo bash install-radicale.sh
@@ -14,11 +15,14 @@
 #   sudo bash install-radicale.sh --reset-passwords      # pick new passwords
 #
 # Re-running is safe: it keeps existing passwords and lists, and rewrites only
-# Radicale's config and rights files (backing up the old ones first).
+# Radicale's config and rights files (backing up the old ones first) and the
+# helper.
 
 set -euo pipefail
 
 PORT=5232
+HELPER_PORT=$((PORT + 1))   # the module looks for it on Radicale's port plus one
+HELPER_DIR="/opt/radicale-lists"
 CONF_DIR="/etc/radicale"
 USERS_FILE="$CONF_DIR/users"
 RIGHTS_FILE="$CONF_DIR/rights"
@@ -38,7 +42,7 @@ warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -138,15 +142,6 @@ filesystem_folder = $STORAGE
 
 [web]
 type = internal
-
-# Lets the Reminders List module, running in the dashboard's browser, ask
-# for the family account's lists (a PROPFIND, which Home Screens' own proxy
-# won't pass). Every request still needs a password.
-[headers]
-Access-Control-Allow-Origin = *
-Access-Control-Allow-Methods = GET, PROPFIND, OPTIONS
-Access-Control-Allow-Headers = Authorization, Depth, Content-Type
-Access-Control-Max-Age = 600
 EOF
 
 backup "$RIGHTS_FILE"
@@ -222,6 +217,106 @@ for _ in $(seq 1 20); do
 done
 curl -s -o /dev/null "http://127.0.0.1:$PORT/" || die "Radicale didn't start. See: sudo journalctl -u radicale -n 50"
 
+# ── The list finder ──────────────────────────────────────────────────────────
+# Finding the family account's lists takes a CalDAV PROPFIND. Home Screens'
+# plugin proxy only passes GET, POST, PUT and PATCH, and its pages may not
+# call Radicale's plain-HTTP address directly. So radicale-lists answers a GET
+# on /family/ (port 5233) by sending Radicale that PROPFIND from the Pi. It
+# holds no passwords: the module's own login is passed on, and Radicale
+# decides what it may see.
+
+step "Installing the list finder (radicale-lists)"
+mkdir -p "$HELPER_DIR"
+cat > "$HELPER_DIR/radicale-lists.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Lists the reminders lists in a Radicale account, for the Reminders List
+Home Screens module. Installed by install-radicale.sh; see its notes."""
+
+import os
+import re
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+RADICALE = os.environ.get("RADICALE_URL", "http://127.0.0.1:5232").rstrip("/")
+HOST = os.environ.get("LISTS_HOST", "0.0.0.0")
+PORT = int(os.environ.get("LISTS_PORT", "5233"))
+
+BODY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/">'
+    "<d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/>"
+    "<a:calendar-color/><a:calendar-order/></d:prop></d:propfind>"
+).encode()
+
+# One account folder: /family/
+ACCOUNT = re.compile(r"^/[A-Za-z0-9._@-]+/$")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "radicale-lists"
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if not ACCOUNT.match(path):
+            return self.reply(404, b"Ask for an account, like /family/\n", "text/plain")
+        headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
+        if self.headers.get("Authorization"):
+            headers["Authorization"] = self.headers["Authorization"]
+        request = urllib.request.Request(RADICALE + path, data=BODY, headers=headers, method="PROPFIND")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as answer:
+                status, body = answer.status, answer.read()
+        except urllib.error.HTTPError as e:
+            status, body = e.code, e.read()
+        except OSError as e:
+            return self.reply(502, f"Radicale unreachable: {e}\n".encode(), "text/plain")
+        self.reply(status, body, "application/xml; charset=utf-8")
+
+    def reply(self, status, body, content_type):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # Every minute from each display; nothing worth keeping.
+
+
+if __name__ == "__main__":
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+PYEOF
+chmod 755 "$HELPER_DIR/radicale-lists.py"
+
+cat > /etc/systemd/system/radicale-lists.service <<EOF
+[Unit]
+Description=Finds Radicale reminders lists for the Home Screens Reminders List module
+After=network-online.target radicale.service
+Wants=network-online.target
+
+[Service]
+Environment=RADICALE_URL=http://127.0.0.1:$PORT
+Environment=LISTS_PORT=$HELPER_PORT
+ExecStart=/usr/bin/python3 $HELPER_DIR/radicale-lists.py
+Restart=always
+RestartSec=5
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable radicale-lists >/dev/null 2>&1
+systemctl restart radicale-lists
+for _ in $(seq 1 20); do
+  curl -s -o /dev/null "http://127.0.0.1:$HELPER_PORT/" && break
+  sleep 0.5
+done
+curl -s -o /dev/null "http://127.0.0.1:$HELPER_PORT/" || die "radicale-lists didn't start. See: sudo journalctl -u radicale-lists -n 50"
+echo "Listening on port $HELPER_PORT."
+
 # ── The starter list ─────────────────────────────────────────────────────────
 
 LIST_URL="http://$PI_IP:$PORT/$FAMILY_USER/$LIST_SLUG/"
@@ -264,6 +359,11 @@ if [[ -n "$DISPLAY_PASSWORD" ]]; then
     echo "It can."
   else
     warn "The $DISPLAY_USER account couldn't read $LOCAL_LIST. See: sudo journalctl -u radicale -n 50"
+  fi
+  if curl -s -u "$DISPLAY_USER:$DISPLAY_PASSWORD" "http://127.0.0.1:$HELPER_PORT/$FAMILY_USER/" | grep -q 'multistatus'; then
+    echo "And it can find the family account's lists."
+  else
+    warn "radicale-lists couldn't list the $FAMILY_USER account. See: sudo journalctl -u radicale-lists -n 50"
   fi
 fi
 

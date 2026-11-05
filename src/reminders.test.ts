@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import household from './fixtures/radicale-household.ics?raw';
 import propfind from './fixtures/radicale-propfind-family.xml?raw';
-import { chooseLists, discoverLists, normalizeColor, parseLists } from './discover';
-import type { DirectFetcher } from './discover';
+import { chooseLists, discoverLists, helperUrl, normalizeColor, parseLists } from './discover';
+import type { Fetcher } from './radicale';
 import { parseDue, parseLine, parseTaskList, unescapeText, unfold } from './ical';
 import type { Task } from './ical';
 import { basicAuth, ListError, parseListUrl, parseSource } from './radicale';
@@ -203,20 +203,31 @@ describe("finding an account's lists", () => {
     expect(normalizeColor('blue')).toBeNull();
   });
 
-  it('sends a Depth 1 PROPFIND with the login and reads the answer', async () => {
-    let seen: Parameters<DirectFetcher>[0] | null = null;
-    const direct: DirectFetcher = async (req) => { seen = req; return { status: 207, body: propfind }; };
-    expect(await discoverLists(direct, ACCOUNT, 'display', 'pw')).toHaveLength(2);
-    expect(seen!.method).toBe('PROPFIND');
-    expect(seen!.headers.Depth).toBe('1');
-    expect(seen!.headers.Authorization).toBe(basicAuth('display', 'pw'));
+  it("asks the helper, on Radicale's port plus one, with the login", async () => {
+    expect(helperUrl(ACCOUNT)).toBe('http://192.168.1.14:5233/family/');
+    let seen: Parameters<Fetcher>[0] | null = null;
+    const fetch: Fetcher = async (req) => { seen = req; return { status: 207, body: propfind }; };
+    expect(await discoverLists(fetch, ACCOUNT, 'display', 'pw')).toHaveLength(2);
+    expect(seen!.url).toBe('http://192.168.1.14:5233/family/');
+    expect(seen!.method ?? 'GET').toBe('GET');
+    expect(seen!.headers?.Authorization).toBe(basicAuth('display', 'pw'));
   });
 
-  it('reports a browser refusal (no CORS headers) apart from a wrong password', async () => {
-    const blocked: DirectFetcher = async () => { throw new TypeError('Failed to fetch'); };
-    await expect(discoverLists(blocked, ACCOUNT, 'display', 'pw')).rejects.toMatchObject({ failure: { kind: 'cantList' } });
-    const denied: DirectFetcher = async () => ({ status: 401, body: '' });
-    await expect(discoverLists(denied, ACCOUNT, 'display', 'pw')).rejects.toBeInstanceOf(ListError);
+  it('still points list addresses at Radicale itself', async () => {
+    const fetch: Fetcher = async () => ({ status: 207, body: propfind });
+    const lists = await discoverLists(fetch, ACCOUNT, 'display', 'pw');
+    expect(lists.every((l) => l.url.startsWith('http://192.168.1.14:5232/family/'))).toBe(true);
+  });
+
+  it('tells a missing helper apart from a wrong password', async () => {
+    const down: Fetcher = async () => ({ status: 502, body: '{"error":"connect ECONNREFUSED 192.168.1.14:5233"}' });
+    await expect(discoverLists(down, ACCOUNT, 'display', 'pw')).rejects.toMatchObject({ failure: { kind: 'cantList' } });
+    const thrown: Fetcher = async () => { throw new TypeError('Failed to fetch'); };
+    await expect(discoverLists(thrown, ACCOUNT, 'display', 'pw')).rejects.toMatchObject({ failure: { kind: 'cantList' } });
+    const denied: Fetcher = async () => ({ status: 401, body: 'Access to the requested resource forbidden.' });
+    await expect(discoverLists(denied, ACCOUNT, 'display', 'pw')).rejects.toMatchObject({ failure: { kind: 'login' } });
+    const other: Fetcher = async () => ({ status: 403, body: 'Access to the requested resource forbidden.' });
+    await expect(discoverLists(other, ACCOUNT, 'display', 'pw')).rejects.toBeInstanceOf(ListError);
   });
 });
 

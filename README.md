@@ -12,7 +12,7 @@ The lists live in **Radicale**, a small CalDAV server on the same Pi as Home Scr
 
 - **Home Wi-Fi only.** Radicale listens on the LAN, not the internet. Changes made away from home wait on the phone and sync the next time it's on the home Wi-Fi.
 - **Display only.** The module shows the list; the phones do all the editing. Its account can read lists but not change them.
-- **Finding lists.** The module asks Radicale for the account's lists with a CalDAV PROPFIND sent straight from the display's browser, since Home Screens' proxy only passes GET, POST, PUT and PATCH. The installer sets Radicale's CORS headers to allow it. Each list is then read through the proxy with a plain GET.
+- **Finding lists.** Listing an account's lists takes a CalDAV PROPFIND. Home Screens' proxy only passes GET, POST, PUT and PATCH, and its pages may not call Radicale's address directly. So the installer adds **radicale-lists**, a small Python helper on port 5233 (Radicale's port plus one) that answers a GET on `/family/` by asking Radicale on the module's behalf. It holds no passwords: the module's own login is passed on. Each list is then read through the proxy with a plain GET.
 - **Light.** Radicale is one Python process using about 30 MB of memory, with the list kept as plain files in `/var/lib/radicale/collections`.
 
 ## What it shows
@@ -45,7 +45,7 @@ It asks for a password for the **family** account, the one every iPhone signs in
 
 `--list "Groceries"` names the starter list something else. Re-running is safe: it keeps the passwords and lists. `--reset-passwords` picks new ones.
 
-**Installed with 1.0.0?** Download the installer again and re-run it, so Radicale sends the CORS headers that let the module find every list. Your passwords and lists stay as they are.
+**Installed before 1.2.0?** Download the installer again and re-run it to add radicale-lists, which the module needs to find every list. Your passwords and lists stay as they are.
 
 Give the Pi a fixed address in your router's DHCP settings (a "reservation") so the phones keep finding it. The examples here use `192.168.1.14`.
 
@@ -113,7 +113,7 @@ CalDAV carries the basics: titles, notes, due dates and times, priority, complet
 | The module says | |
 |---|---|
 | Can't reach Radicale | `sudo systemctl status radicale`, and check the address. `sudo journalctl -u radicale -n 50` shows why it stopped. |
-| Can't ask ... for its lists | Radicale isn't sending the CORS headers (installed with 1.0.0): re-run the installer. Or Radicale is down, as above. |
+| Can't ask ... for its lists | radicale-lists isn't answering on port 5233. Installed before 1.2.0: re-run the installer. Otherwise `sudo systemctl status radicale-lists`. |
 | Home Screens blocked the request | The address is `localhost` or `127.0.0.1`; use the Pi's network address. |
 | Turned down the user name or password | Re-run the installer with `--reset-passwords`, then update the module. |
 | This account can't read that list | The list belongs to an account other than `family`. |
@@ -133,9 +133,9 @@ npm run preview      # module against a fake list at http://localhost:5183
 npm run build        # dist/bundle.js
 ```
 
-The preview shows three fake lists. It takes `?w=&h=` for the module size, `fs=` for text size, `tz=`, `fail=1` to start with Radicale unreachable, `nocors=1` for a Radicale without CORS headers, and any config key (`onlyLists=Groceries`, `sortBy=due`, `keepDoneHours=6`, or one list's own `listUrl=`). Its buttons add and check off items the way a phone would.
+The preview shows three fake lists. It takes `?w=&h=` for the module size, `fs=` for text size, `tz=`, `fail=1` to start with Radicale unreachable, `nohelper=1` for a Pi without radicale-lists, and any config key (`onlyLists=Groceries`, `sortBy=due`, `keepDoneHours=6`, or one list's own `listUrl=`). Its buttons add and check off items the way a phone would.
 
-The fixtures are real Radicale 3.9 answers: `radicale-household.ics` is a GET on a list holding what the Reminders app writes, and `radicale-propfind-family.xml` a Depth 1 PROPFIND on the family account. To record new ones, run Radicale locally with the installer's config, add lists and items over CalDAV, and save what a GET on `/family/<list>/` and a PROPFIND on `/family/` return.
+The fixtures are real Radicale 3.9 answers: `radicale-household.ics` is a GET on a list holding what the Reminders app writes, and `radicale-propfind-family.xml` a Depth 1 PROPFIND on the family account. To record new ones, run Radicale locally with the installer's config, add lists and items over CalDAV, and save what a GET on `/family/<list>/` and a PROPFIND on `/family/` return (the PROPFIND radicale-lists sends is in the installer).
 
 Release tarball:
 

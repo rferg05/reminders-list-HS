@@ -6,8 +6,8 @@ import { readConfig } from './config';
 import type { Config } from './config';
 import type { TaskList } from './ical';
 import { wallClock } from './ical';
-import { browserFetcher, chooseLists, discoverLists } from './discover';
-import type { DirectFetcher, ListInfo } from './discover';
+import { chooseLists, discoverLists } from './discover';
+import type { ListInfo } from './discover';
 import { hostFetcher, ListError, loadList, parseSource, PLUGIN_ID } from './radicale';
 import type { Failure, Fetcher, Source } from './radicale';
 import { arrange, dueLabel, formatTime, trimOne } from './tasks';
@@ -69,11 +69,11 @@ const failureOf = (e: unknown): Failure => (e instanceof ListError ? e.failure :
 
 /** One pass: find the lists (for an account), then read each. A list that
  *  fails keeps its last good copy, marked with the failure. */
-async function refresh(session: Session, source: Source, cfg: Config, tz: string, fetcher: Fetcher, direct: DirectFetcher): Promise<void> {
+async function refresh(session: Session, source: Source, cfg: Config, tz: string, fetcher: Fetcher): Promise<void> {
   let infos: ListInfo[];
   if (source.kind === 'account') {
     try {
-      infos = chooseLists(await discoverLists(direct, source.url, cfg.username, cfg.password), cfg.onlyLists);
+      infos = chooseLists(await discoverLists(fetcher, source.url, cfg.username, cfg.password), cfg.onlyLists);
     } catch (e) {
       session.failure = failureOf(e);
       return;
@@ -99,7 +99,7 @@ const firstFailure = (s: Session): Failure | null => s.failure ?? s.sections?.fi
 
 /** Loads the lists now, then keeps them fresh. Returns a counter that
  *  changes whenever the session does. */
-function useLists(source: Source | null, cfg: Config, tz: string, fetcher: Fetcher, direct: DirectFetcher): [Session | null, number] {
+function useLists(source: Source | null, cfg: Config, tz: string, fetcher: Fetcher): [Session | null, number] {
   const [tick, setTick] = useState(0);
   const key = source ? sourceKey(source, cfg) : null;
   const session = useMemo(() => (key ? sessionFor(key) : null), [key]);
@@ -117,7 +117,7 @@ function useLists(source: Source | null, cfg: Config, tz: string, fetcher: Fetch
         session.loading = (async () => {
           const had = firstFailure(session);
           try {
-            await refresh(session, source, cfgRef.current, tz, fetcher, direct);
+            await refresh(session, source, cfgRef.current, tz, fetcher);
           } finally {
             session.loading = null;
           }
@@ -145,7 +145,7 @@ function useLists(source: Source | null, cfg: Config, tz: string, fetcher: Fetch
       alive = false;
       clearTimeout(timer);
     };
-  }, [session, fetcher, direct, cfg.password, cfg.refreshSeconds, tz]);
+  }, [session, fetcher, cfg.password, cfg.refreshSeconds, tz]);
 
   return [session, tick];
 }
@@ -414,7 +414,7 @@ function failureNotice(f: Failure, url: string): { title: string; detail?: strin
     case 'unreachable':
       return { title: `Can't reach Radicale at ${hostOf(url)}`, detail: 'Check that it is running on the Pi: sudo systemctl status radicale' };
     case 'cantList':
-      return { title: `Can't ask ${hostOf(url)} for its lists`, detail: 'Re-run install-radicale.sh on the Pi (it keeps passwords and lists): it lets the dashboard find lists. Or check that Radicale is running.' };
+      return { title: `Can't ask ${hostOf(url)} for its lists`, detail: 'The radicale-lists helper on the Pi finds them. Re-run install-radicale.sh (it keeps passwords and lists) to add it, or check it: sudo systemctl status radicale-lists' };
     case 'proxy':
       return { title: 'Home Screens blocked the request to Radicale', detail: f.message };
     case 'login':
@@ -449,15 +449,14 @@ const defaultTz = () => {
   }
 };
 
-export default function RemindersList(props: PluginComponentProps & { fetcher?: Fetcher; direct?: DirectFetcher; now?: number }) {
+export default function RemindersList(props: PluginComponentProps & { fetcher?: Fetcher; now?: number }) {
   const { style } = props;
   const cfg = useMemo(() => readConfig(props.config ?? {}), [props.config]);
   const parsed = useMemo(() => parseSource(cfg.listUrl), [cfg.listUrl]);
   const source = typeof parsed === 'string' ? null : parsed;
   const tz = props.timezone || defaultTz();
   const fetcher = useMemo(() => props.fetcher ?? hostFetcher(), [props.fetcher]);
-  const direct = useMemo(() => props.direct ?? browserFetcher(), [props.direct]);
-  const [session] = useLists(source, cfg, tz, fetcher, direct);
+  const [session] = useLists(source, cfg, tz, fetcher);
   const clock = useNow();
   const now = props.now ?? clock;
   const [boxRef, box] = useBoxSize();

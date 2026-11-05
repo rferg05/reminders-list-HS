@@ -1,7 +1,7 @@
 {
   "id": "reminders-list",
   "name": "Reminders List",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Shared to-do lists that everyone edits in the iPhone Reminders app. The lists live in Radicale on the Pi; the module shows one or all of them, large enough to read across the room.",
   "author": "Ryan",
   "license": "MIT",

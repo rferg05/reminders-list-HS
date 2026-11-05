@@ -1,13 +1,15 @@
 // Finding every reminders list in an account, so lists made on a phone show
 // up without anyone copying their address.
 //
-// That takes a CalDAV PROPFIND, which the host proxy refuses (it only passes
-// GET, POST, PUT and PATCH). So this one request goes from the display's
-// browser straight to Radicale, which allows it once its config sends CORS
-// headers (the installer adds them). The lists' contents still come through
-// the proxy with a plain GET.
+// That takes a CalDAV PROPFIND. Home Screens' proxy only passes GET, POST,
+// PUT and PATCH, and its pages' Content Security Policy won't let a plugin
+// call Radicale's plain-HTTP address directly. So a small helper on the Pi
+// (radicale-lists, which the installer sets up beside Radicale) answers a
+// GET on the same account folder, on the next port up, by sending Radicale
+// the PROPFIND itself with the caller's login. Its answer is Radicale's.
 
-import { basicAuth, ListError } from './radicale';
+import { basicAuth, failureOf, ListError } from './radicale';
+import type { Fetcher, ProxyAnswer } from './radicale';
 
 export interface ListInfo {
   /** `http://192.168.1.14:5232/family/5C2E9A10-.../` */
@@ -19,25 +21,16 @@ export interface ListInfo {
   order: number | null;
 }
 
-export interface DirectAnswer {
-  status: number;
-  body: string;
+/** The helper listens on Radicale's port plus one. */
+export const HELPER_PORT_OFFSET = 1;
+
+/** `http://192.168.1.14:5232/family/` to `http://192.168.1.14:5233/family/`. */
+export function helperUrl(accountUrl: string): string {
+  const u = new URL(accountUrl);
+  const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+  u.port = String(port + HELPER_PORT_OFFSET);
+  return u.toString();
 }
-
-export type DirectFetcher = (req: { url: string; method: 'PROPFIND'; headers: Record<string, string>; body: string }) => Promise<DirectAnswer>;
-
-export function browserFetcher(): DirectFetcher {
-  return async (req) => {
-    const res = await fetch(req.url, { method: req.method, headers: req.headers, body: req.body, mode: 'cors', credentials: 'omit', cache: 'no-store' });
-    return { status: res.status, body: await res.text() };
-  };
-}
-
-export const PROPFIND_BODY =
-  '<?xml version="1.0" encoding="utf-8"?>' +
-  '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/">' +
-  '<d:prop><d:resourcetype/><d:displayname/><c:supported-calendar-component-set/><a:calendar-color/><a:calendar-order/></d:prop>' +
-  '</d:propfind>';
 
 const unxml = (s: string) =>
   s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
@@ -85,22 +78,21 @@ export function parseLists(xml: string, accountUrl: string): ListInfo[] {
   return out;
 }
 
-export async function discoverLists(fetch: DirectFetcher, accountUrl: string, user: string, password: string): Promise<ListInfo[]> {
-  const headers: Record<string, string> = { Depth: '1', 'Content-Type': 'application/xml; charset=utf-8' };
+export async function discoverLists(fetch: Fetcher, accountUrl: string, user: string, password: string): Promise<ListInfo[]> {
+  const headers: Record<string, string> = { Accept: 'application/xml' };
   if (user) headers.Authorization = basicAuth(user, password);
-  let answer: DirectAnswer;
+  let answer: ProxyAnswer;
   try {
-    answer = await fetch({ url: accountUrl, method: 'PROPFIND', headers, body: PROPFIND_BODY });
+    answer = await fetch({ url: helperUrl(accountUrl), headers });
   } catch {
-    // A browser hides why: Radicale down and Radicale without CORS
-    // headers look the same from here.
     throw new ListError({ kind: 'cantList' });
   }
-  if (answer.status === 401) throw new ListError({ kind: 'login' });
-  if (answer.status === 403) throw new ListError({ kind: 'forbidden' });
-  if (answer.status === 404) throw new ListError({ kind: 'notFound' });
-  if (answer.status !== 207) throw new ListError({ kind: 'unexpected', status: answer.status });
-  return parseLists(answer.body, accountUrl);
+  // Radicale answers 207; accept any success in case the proxy rewrites it.
+  if (answer.status >= 200 && answer.status < 300 && /multistatus/i.test(answer.body)) return parseLists(answer.body, accountUrl);
+  const failure = failureOf(answer);
+  // Nothing answering on the helper's port: the proxy reports it as an
+  // error of its own, which reads as "unreachable".
+  throw new ListError(failure.kind === 'unreachable' || failure.kind === 'unexpected' ? { kind: 'cantList' } : failure);
 }
 
 /** The phone's order of lists, then by name. With `only` names given, just

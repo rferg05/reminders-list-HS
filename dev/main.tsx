@@ -5,12 +5,11 @@ import RemindersList from '../src/index';
 import { addDays } from '../src/tasks';
 import { wallClock } from '../src/ical';
 import type { Fetcher } from '../src/radicale';
-import type { DirectFetcher } from '../src/discover';
 import { makeHostDisplayCache } from './host-cache';
 
 // Stand-in for the host: just enough SDK for the module to run.
 // `?w=&h=` module size, `fs=` text size, `tz=`, `fail=1` to start with
-// Radicale unreachable, `nocors=1` for a Radicale without CORS headers, and
+// Radicale unreachable, `nohelper=1` for a Pi without the radicale-lists helper, and
 // any config key (`listUrl=http://192.168.1.14:5232/family/household/` for
 // one list, `onlyLists=Groceries`, `sortBy=due`, `keepDoneHours=6`).
 const params = new URLSearchParams(location.search);
@@ -55,6 +54,7 @@ const groceries: Item[] = [
 ];
 
 const ACCOUNT = 'http://192.168.1.14:5232/family/';
+const HELPER = 'http://192.168.1.14:5233/family/';
 // As the phones made them: Household by the installer, the others in the
 // Reminders app, so with random folder names, colors and an order.
 const lists = [
@@ -84,15 +84,14 @@ const devFetcher: Fetcher = async (req) => {
   await new Promise((r) => setTimeout(r, 150));
   if (down) throw new Error('ECONNREFUSED');
   if (req.headers?.Authorization !== LOGIN) return { status: 401, body: 'Access to the requested resource forbidden.' };
+  // The radicale-lists helper, on the next port up.
+  if (req.url === HELPER) {
+    return params.get('nohelper') === '1'
+      ? { status: 502, body: '{"error":"connect ECONNREFUSED 192.168.1.14:5233"}' }
+      : { status: 207, body: multistatus() };
+  }
   const list = lists.find((l) => req.url === ACCOUNT + l.path);
   return list ? { status: 200, body: ics(list.name, list.items()) } : { status: 404, body: 'The requested resource could not be found.' };
-};
-// The PROPFIND the module sends straight from the browser.
-const devDirect: DirectFetcher = async (req) => {
-  await new Promise((r) => setTimeout(r, 100));
-  if (down || params.get('nocors') === '1') throw new TypeError('Failed to fetch');
-  if (req.headers.Authorization !== LOGIN) return { status: 401, body: '' };
-  return { status: 207, body: multistatus() };
 };
 
 const style = {
@@ -106,7 +105,7 @@ const config: Record<string, unknown> = {
   password: 'preview',
   refreshSeconds: 15,
   keepDoneHours: 2,
-  ...Object.fromEntries([...params].filter(([k]) => !['w', 'h', 'fs', 'tz', 'fail', 'nocors'].includes(k))),
+  ...Object.fromEntries([...params].filter(([k]) => !['w', 'h', 'fs', 'tz', 'fail', 'nohelper'].includes(k))),
 };
 
 /** The module at a size you can change, plus buttons that act like a phone. */
@@ -140,7 +139,7 @@ function Harness() {
         <span>{w}×{h}</span>
       </div>
       <div id="module" style={{ width: w, height: h, resize: 'both', overflow: 'hidden' }}>
-        <RemindersList key={mount} config={config} style={style} timezone={timezone} fetcher={devFetcher} direct={devDirect} />
+        <RemindersList key={mount} config={config} style={style} timezone={timezone} fetcher={devFetcher} />
       </div>
     </div>
   );
