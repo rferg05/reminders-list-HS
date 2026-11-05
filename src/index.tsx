@@ -1,14 +1,16 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { PluginComponentProps } from './hs-plugin';
-import { hostFrameStyle } from './host-style';
+import { hostFrameStyle, scalePx } from './host-style';
 import { readConfig } from './config';
 import type { Config } from './config';
-import type { Task, TaskList } from './ical';
+import type { TaskList } from './ical';
 import { wallClock } from './ical';
-import { hostFetcher, ListError, loadList, parseListUrl, PLUGIN_ID } from './radicale';
-import type { Failure, Fetcher } from './radicale';
-import { arrange, dueLabel, formatTime } from './tasks';
+import { browserFetcher, chooseLists, discoverLists } from './discover';
+import type { DirectFetcher, ListInfo } from './discover';
+import { hostFetcher, ListError, loadList, parseSource, PLUGIN_ID } from './radicale';
+import type { Failure, Fetcher, Source } from './radicale';
+import { arrange, dueLabel, formatTime, trimOne } from './tasks';
 import type { DueTone, Row, TimeFormat } from './tasks';
 
 /** A failed refresh is tried again sooner than a good one is repeated. */
@@ -18,26 +20,35 @@ const CACHE_TTL_MS = 7 * 86_400_000;
 
 // ── List sessions ───────────────────────────────────────────────────────────
 // Kept outside React so a module that unmounts when its screen rotates away
-// shows the list at once when it comes back, without asking Radicale again.
+// shows its lists at once when it comes back, then catches up.
 
-interface Session {
+interface Section {
+  info: ListInfo;
   list: TaskList | null;
   failure: Failure | null;
-  /** When the list last loaded successfully (UTC ms). */
+  /** When this list last loaded (UTC ms). */
   okAt: number;
+}
+
+interface Session {
+  /** Null until the first answer (or a cached copy). */
+  sections: Section[] | null;
+  /** Finding the account's lists failed. Each list's own failure is on its section. */
+  failure: Failure | null;
   loading: Promise<void> | null;
 }
 
 const sessions = new Map<string, Session>();
-const cacheKey = (url: string) => `${PLUGIN_ID}:${url}`;
+const sourceKey = (s: Source, cfg: Config) =>
+  `${cfg.username}@${s.kind === 'account' ? s.url : s.urls.join(' ')}|${cfg.onlyLists.join(',')}`;
+const cacheKey = (key: string) => `${PLUGIN_ID}:${key}`;
 
-function sessionFor(url: string, user: string): Session {
-  const id = `${user}@${url}`;
-  let s = sessions.get(id);
+function sessionFor(key: string): Session {
+  let s = sessions.get(key);
   if (!s) {
-    const cached = window.__HS_SDK__?.displayCache?.get<{ list: TaskList; okAt: number }>(cacheKey(url));
-    s = { list: cached?.data.list ?? null, failure: null, okAt: cached?.data.okAt ?? 0, loading: null };
-    sessions.set(id, s);
+    const cached = window.__HS_SDK__?.displayCache?.get<Section[]>(cacheKey(key));
+    s = { sections: cached?.data ?? null, failure: null, loading: null };
+    sessions.set(key, s);
   }
   return s;
 }
@@ -54,14 +65,49 @@ function health(failure: Failure | null, since: number) {
   } catch { /* best effort */ }
 }
 
-/** Loads the list now if it's due, then keeps it fresh. Returns a counter
- *  that changes whenever the session does. */
-function useList(url: string | null, cfg: Config, tz: string, fetcher: Fetcher): [Session | null, number] {
+const failureOf = (e: unknown): Failure => (e instanceof ListError ? e.failure : { kind: 'unreachable' });
+
+/** One pass: find the lists (for an account), then read each. A list that
+ *  fails keeps its last good copy, marked with the failure. */
+async function refresh(session: Session, source: Source, cfg: Config, tz: string, fetcher: Fetcher, direct: DirectFetcher): Promise<void> {
+  let infos: ListInfo[];
+  if (source.kind === 'account') {
+    try {
+      infos = chooseLists(await discoverLists(direct, source.url, cfg.username, cfg.password), cfg.onlyLists);
+    } catch (e) {
+      session.failure = failureOf(e);
+      return;
+    }
+  } else {
+    infos = source.urls.map((url) => ({ url, name: '', color: null, order: null }));
+  }
+  session.failure = null;
+  const before = new Map((session.sections ?? []).map((s) => [s.info.url, s]));
+  session.sections = await Promise.all(infos.map(async (info): Promise<Section> => {
+    try {
+      const list = await loadList(fetcher, info.url, cfg.username, cfg.password, tz);
+      return { info, list, failure: null, okAt: Date.now() };
+    } catch (e) {
+      const prev = before.get(info.url);
+      return { info, list: prev?.list ?? null, failure: failureOf(e), okAt: prev?.okAt ?? 0 };
+    }
+  }));
+}
+
+/** First failure anywhere in the session, for logs and health. */
+const firstFailure = (s: Session): Failure | null => s.failure ?? s.sections?.find((x) => x.failure)?.failure ?? null;
+
+/** Loads the lists now, then keeps them fresh. Returns a counter that
+ *  changes whenever the session does. */
+function useLists(source: Source | null, cfg: Config, tz: string, fetcher: Fetcher, direct: DirectFetcher): [Session | null, number] {
   const [tick, setTick] = useState(0);
-  const session = useMemo(() => (url ? sessionFor(url, cfg.username) : null), [url, cfg.username]);
+  const key = source ? sourceKey(source, cfg) : null;
+  const session = useMemo(() => (key ? sessionFor(key) : null), [key]);
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
 
   useEffect(() => {
-    if (!session || !url) return;
+    if (!session || !source || !key) return;
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const refreshMs = cfg.refreshSeconds * 1000;
@@ -69,31 +115,27 @@ function useList(url: string | null, cfg: Config, tz: string, fetcher: Fetcher):
     const run = async () => {
       if (!session.loading) {
         session.loading = (async () => {
+          const had = firstFailure(session);
           try {
-            session.list = await loadList(fetcher, url, cfg.username, cfg.password, tz);
-            session.okAt = Date.now();
-            if (session.failure) {
-              log('info', 'Radicale is answering again');
-              health(null, 0);
-            }
-            session.failure = null;
-            window.__HS_SDK__?.displayCache?.set(cacheKey(url), { list: session.list, okAt: session.okAt }, CACHE_TTL_MS);
-          } catch (e) {
-            const failure: Failure = e instanceof ListError ? e.failure : { kind: 'unreachable' };
-            if (session.failure?.kind !== failure.kind) {
-              log('warn', `List refresh failed: ${failure.kind}`);
-              health(failure, Date.now());
-            }
-            session.failure = failure;
+            await refresh(session, source, cfgRef.current, tz, fetcher, direct);
           } finally {
             session.loading = null;
           }
+          const now = firstFailure(session);
+          if (now && now.kind !== had?.kind) {
+            log('warn', `Refresh failed: ${now.kind}`);
+            health(now, Date.now());
+          } else if (!now && had) {
+            log('info', 'Radicale is answering again');
+            health(null, 0);
+          }
+          if (session.sections) window.__HS_SDK__?.displayCache?.set(cacheKey(key), session.sections, CACHE_TTL_MS);
         })();
       }
       await session.loading;
       if (!alive) return;
       setTick((t) => t + 1);
-      timer = setTimeout(run, session.failure ? Math.min(RETRY_MS, refreshMs) : refreshMs);
+      timer = setTimeout(run, firstFailure(session) ? Math.min(RETRY_MS, refreshMs) : refreshMs);
     };
 
     // Radicale answers in milliseconds, so ask on every mount: a screen
@@ -103,7 +145,7 @@ function useList(url: string | null, cfg: Config, tz: string, fetcher: Fetcher):
       alive = false;
       clearTimeout(timer);
     };
-  }, [session, fetcher, cfg.password, cfg.refreshSeconds, tz]);
+  }, [session, fetcher, direct, cfg.password, cfg.refreshSeconds, tz]);
 
   return [session, tick];
 }
@@ -153,7 +195,7 @@ function toneStyle(tone: DueTone, accent: string): CSSProperties {
   }
 }
 
-function Ring({ done, accent }: { done: boolean; accent: string }) {
+function Ring({ done, color }: { done: boolean; color: string }) {
   return (
     <span
       aria-hidden
@@ -164,8 +206,8 @@ function Ring({ done, accent }: { done: boolean; accent: string }) {
         marginTop: '0.18em',
         borderRadius: '50%',
         boxSizing: 'border-box',
-        border: `0.12em solid ${accent}`,
-        background: done ? accent : 'rgba(0,0,0,0.15)',
+        border: `0.12em solid ${color}`,
+        background: done ? color : 'rgba(0,0,0,0.15)',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -189,7 +231,7 @@ interface RowContext {
   timeFormat: TimeFormat;
 }
 
-function TaskRow({ row, ctx }: { row: Row; ctx: RowContext }) {
+function TaskRow({ row, ctx, color }: { row: Row; ctx: RowContext; color: string }) {
   const { task, depth } = row;
   const { cfg } = ctx;
   const due = cfg.showDue && task.due && !task.done ? dueLabel(task.due, ctx.today, ctx.nowTime, ctx.timeFormat) : null;
@@ -197,7 +239,6 @@ function TaskRow({ row, ctx }: { row: Row; ctx: RowContext }) {
   return (
     <div
       style={{
-        breakInside: 'avoid',
         display: 'flex',
         gap: '0.55em',
         padding: '0.32em 0',
@@ -206,7 +247,7 @@ function TaskRow({ row, ctx }: { row: Row; ctx: RowContext }) {
         opacity: task.done ? 0.5 : 1,
       }}
     >
-      <Ring done={task.done} accent={cfg.accentColor} />
+      <Ring done={task.done} color={color} />
       <div style={{ minWidth: 0, flex: 1 }}>
         <div
           style={{
@@ -220,13 +261,13 @@ function TaskRow({ row, ctx }: { row: Row; ctx: RowContext }) {
           }}
         >
           {cfg.showPriority && task.priority && !task.done && (
-            <span style={{ color: cfg.accentColor, fontWeight: 700, marginRight: '0.3em' }}>{MARKS[task.priority]}</span>
+            <span style={{ color, fontWeight: 700, marginRight: '0.3em' }}>{MARKS[task.priority]}</span>
           )}
           {task.title || <span style={{ opacity: 0.6 }}>(no title)</span>}
         </div>
         {(due || notes) && (
           <div style={{ fontSize: '0.78em', lineHeight: 1.3, marginTop: '0.1em', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {due && <span style={toneStyle(due.tone, cfg.accentColor)}>{due.text}</span>}
+            {due && <span style={toneStyle(due.tone, color)}>{due.text}</span>}
             {due && notes && <span style={{ opacity: 0.5 }}> · </span>}
             {notes && <span style={{ opacity: 0.7 }}>{notes}</span>}
           </div>
@@ -236,40 +277,71 @@ function TaskRow({ row, ctx }: { row: Row; ctx: RowContext }) {
   );
 }
 
+/** A list's name and how many are left, underlined in its color. */
+function Heading({ name, open, color, size, note, gapBelow = '0.3em' }: { name: string; open: number; color: string; size: string; note?: string; gapBelow?: string }) {
+  return (
+    // A whole-pixel rule: a fractional one (0.08em) is antialiased toward
+    // gray at some positions, so lists' colors read inconsistently.
+    <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.6em', marginBottom: gapBelow, paddingBottom: '0.3em', borderBottom: `${scalePx(2)} solid ${color}` }}>
+      <div style={{ fontSize: size, fontWeight: 700, flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</div>
+      {note && <div style={{ fontSize: '0.7em', opacity: 0.7, whiteSpace: 'nowrap' }}>{note}</div>}
+      {open > 0 && <div style={{ fontSize: '0.8em', opacity: 0.75, whiteSpace: 'nowrap' }}>{open} to do</div>}
+    </div>
+  );
+}
+
 // ── Fitting ─────────────────────────────────────────────────────────────────
-// Rows fill the first column top to bottom, then the next. With Columns on
-// Auto a second (and third) column is used only when one won't hold them
-// all, and only while each column stays wide enough to read. Whatever still
-// doesn't fit is left off with "+3 more".
+// Lists flow down the first column, then the next. With Columns on Auto a
+// second (and third) column is used only when one won't hold everything,
+// and only while each column stays wide enough to read. Whatever still
+// doesn't fit is cut from the longest list first, each ending "+3 more", so
+// one long list can't push the others off the screen.
+
+interface Group {
+  key: string;
+  /** Null for a lone list, whose heading sits above the columns. */
+  name: string | null;
+  open: number;
+  color: string;
+  rows: Row[];
+  /** Shown in place of rows when the list is empty, or failing. */
+  message: string;
+}
 
 interface Fit {
   cols: number;
-  shown: number;
+  shown: number[];
 }
 
 function maxAutoCols(width: number, fontPx: number): number {
   return Math.max(1, Math.min(3, Math.floor(width / (fontPx * 13))));
 }
 
-function TaskColumns({ rows, ctx, fontPx, box }: { rows: Row[]; ctx: RowContext; fontPx: number; box: { w: number; h: number } }) {
+function GroupColumns({ groups, ctx, fontPx, box }: { groups: Group[]; ctx: RowContext; fontPx: number; box: { w: number; h: number } }) {
   const ref = useRef<HTMLDivElement>(null);
   const fixed = ctx.cfg.columns === 'auto' ? null : Number(ctx.cfg.columns);
-  const start = (): Fit => ({ cols: fixed ?? 1, shown: rows.length });
+  const start = (): Fit => ({ cols: fixed ?? 1, shown: groups.map((g) => g.rows.length) });
   const [fit, setFit] = useState<Fit>(start);
-  const signature = `${rows.map((r) => `${r.task.uid}:${r.task.done}:${r.task.title.length}`).join(',')}|${box.w}x${box.h}|${fontPx}|${ctx.cfg.columns}|${ctx.cfg.showDue}|${ctx.cfg.showNotes}`;
+  const signature = [
+    groups.map((g) => `${g.key}:${g.name}:${g.message}:${g.rows.map((r) => `${r.task.uid}/${r.task.done}/${r.task.title.length}`).join(',')}`).join('|'),
+    `${box.w}x${box.h}`, fontPx, ctx.cfg.columns, ctx.cfg.showDue, ctx.cfg.showNotes,
+  ].join('#');
 
   useLayoutEffect(() => setFit(start()), [signature]);
 
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    if (!el || fit.shown.length !== groups.length) return;
     const over = el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1;
     if (!over) return;
-    if (!fixed && fit.cols < maxAutoCols(box.w, fontPx)) setFit({ ...fit, cols: fit.cols + 1 });
-    else if (fit.shown > 0) setFit({ ...fit, shown: fit.shown - 1 });
+    if (!fixed && fit.cols < maxAutoCols(box.w, fontPx)) {
+      setFit({ ...fit, cols: fit.cols + 1 });
+      return;
+    }
+    const shown = trimOne(fit.shown);
+    if (shown) setFit({ ...fit, shown });
   });
 
-  const hidden = rows.length - fit.shown;
   return (
     <div
       ref={ref}
@@ -283,12 +355,31 @@ function TaskColumns({ rows, ctx, fontPx, box }: { rows: Row[]; ctx: RowContext;
         columnRule: fit.cols > 1 ? '1px solid rgba(255,255,255,0.12)' : undefined,
       }}
     >
-      {rows.slice(0, fit.shown).map((r) => <TaskRow key={r.task.uid} row={r} ctx={ctx} />)}
-      {hidden > 0 && (
-        <div style={{ breakInside: 'avoid', padding: '0.3em 0 0 1.55em', fontSize: '0.85em', opacity: 0.7 }}>
-          +{hidden} more
-        </div>
-      )}
+      {groups.map((g, gi) => {
+        const n = fit.shown[gi] ?? g.rows.length;
+        const rows = g.rows.slice(0, n);
+        const hidden = g.rows.length - rows.length;
+        const row = (r: Row) => <TaskRow key={r.task.uid} row={r} ctx={ctx} color={g.color} />;
+        return (
+          // Margin, not padding: a list that starts a column drops it there,
+          // so its heading lines up with the other columns' tops.
+          <div key={g.key} style={{ marginTop: gi > 0 && g.name !== null ? '0.7em' : 0 }}>
+            {/* A heading never ends a column on its own: it moves with its first row. */}
+            <div style={{ breakInside: 'avoid' }}>
+              {g.name !== null && <Heading name={g.name} open={g.open} color={g.color} size="1em" />}
+              {rows.length > 0 ? row(rows[0]) : g.message && (
+                <div style={{ padding: '0.2em 0 0.2em 1.55em', fontSize: '0.85em', opacity: 0.65 }}>{g.message}</div>
+              )}
+            </div>
+            {rows.slice(1).map((r) => <div key={r.task.uid} style={{ breakInside: 'avoid' }}>{row(r)}</div>)}
+            {hidden > 0 && (
+              <div style={{ breakInside: 'avoid', padding: '0.3em 0 0 1.55em', fontSize: '0.85em', opacity: 0.7 }}>
+                +{hidden} more
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -316,25 +407,37 @@ function Notice({ title, detail }: { title: string; detail?: string }) {
   );
 }
 
+const hostOf = (url: string) => { try { return new URL(url).host; } catch { return url; } };
+
 function failureNotice(f: Failure, url: string): { title: string; detail?: string } {
-  const origin = (() => { try { return new URL(url).host; } catch { return url; } })();
   switch (f.kind) {
     case 'unreachable':
-      return { title: `Can't reach Radicale at ${origin}`, detail: 'Check that it is running on the Pi: sudo systemctl status radicale' };
+      return { title: `Can't reach Radicale at ${hostOf(url)}`, detail: 'Check that it is running on the Pi: sudo systemctl status radicale' };
+    case 'cantList':
+      return { title: `Can't ask ${hostOf(url)} for its lists`, detail: 'Re-run install-radicale.sh on the Pi (it keeps passwords and lists): it lets the dashboard find lists. Or check that Radicale is running.' };
     case 'proxy':
       return { title: 'Home Screens blocked the request to Radicale', detail: f.message };
     case 'login':
       return { title: 'Radicale turned down the user name or password', detail: "Check them in this module's settings. The installer printed the display account's password." };
     case 'forbidden':
-      return { title: "This account can't read that list", detail: 'The display account can read lists in the family account only.' };
+      return { title: "This account can't read that", detail: 'The display account can read the family account and its lists only.' };
     case 'notFound':
-      return { title: 'No list at that address', detail: "Copy the list's address from Radicale's web page, http://<pi>:5232/.web" };
+      return { title: 'Nothing at that address', detail: "Use the family account's address, like http://192.168.1.14:5232/family/, to show every list." };
     case 'notAList':
-      return { title: "That address isn't a reminders list", detail: 'It should end in the list\'s folder, like /family/household/' };
+      return { title: "That address isn't a reminders list", detail: "Use the family account's address, like http://192.168.1.14:5232/family/, to show every list." };
     default:
       return { title: `Radicale answered with an error (${f.status})` };
   }
 }
+
+/** One line for a list that can't be read, under its heading. */
+const shortFailure = (f: Failure) =>
+  f.kind === 'login' ? 'Wrong user name or password'
+    : f.kind === 'forbidden' ? "The display account can't read this list"
+      : f.kind === 'notFound' ? 'No list at this address'
+        : f.kind === 'notAList' ? "This isn't a reminders list"
+          : f.kind === 'proxy' ? `Blocked by Home Screens: ${f.message}`
+            : "Can't reach Radicale";
 
 // ── Module ──────────────────────────────────────────────────────────────────
 
@@ -346,36 +449,65 @@ const defaultTz = () => {
   }
 };
 
-export default function RemindersList(props: PluginComponentProps & { fetcher?: Fetcher; now?: number }) {
+export default function RemindersList(props: PluginComponentProps & { fetcher?: Fetcher; direct?: DirectFetcher; now?: number }) {
   const { style } = props;
   const cfg = useMemo(() => readConfig(props.config ?? {}), [props.config]);
-  const parsed = useMemo(() => parseListUrl(cfg.listUrl), [cfg.listUrl]);
-  const url = parsed === 'empty' || parsed === 'notALink' || parsed === 'loopback' ? null : parsed;
+  const parsed = useMemo(() => parseSource(cfg.listUrl), [cfg.listUrl]);
+  const source = typeof parsed === 'string' ? null : parsed;
   const tz = props.timezone || defaultTz();
   const fetcher = useMemo(() => props.fetcher ?? hostFetcher(), [props.fetcher]);
-  const [session] = useList(url, cfg, tz, fetcher);
+  const direct = useMemo(() => props.direct ?? browserFetcher(), [props.direct]);
+  const [session] = useLists(source, cfg, tz, fetcher, direct);
   const clock = useNow();
   const now = props.now ?? clock;
   const [boxRef, box] = useBoxSize();
 
   const timeFormat: TimeFormat = cfg.timeFormat === 'auto' ? props.timeFormat ?? '12h' : cfg.timeFormat;
   const wall = wallClock(now, tz);
-  const list = session?.list ?? null;
-  const rows = useMemo(
-    () => (list ? arrange(list.tasks, cfg.sortBy, cfg.keepDoneHours * 3_600_000, now) : []),
-    [list, cfg.sortBy, cfg.keepDoneHours, now],
-  );
-  const openCount = list ? list.tasks.filter((t: Task) => !t.done).length : 0;
+  const sections = session?.sections ?? null;
+  const lone = sections?.length === 1 && !(source?.kind === 'account' && cfg.title);
+
+  const groups = useMemo((): Group[] => {
+    if (!sections) return [];
+    const all = sections.map((s, i): Group => {
+      const rows = s.list ? arrange(s.list.tasks, cfg.sortBy, cfg.keepDoneHours * 3_600_000, now) : [];
+      return {
+        key: `${i}:${s.info.url}`,
+        name: lone ? null : s.info.name || s.list?.name || 'To-do',
+        open: s.list ? s.list.tasks.filter((t) => !t.done).length : 0,
+        color: (cfg.listColors && s.info.color) || cfg.accentColor,
+        rows,
+        message: !s.list && s.failure ? shortFailure(s.failure) : rows.length === 0 ? cfg.emptyText : '',
+      };
+    });
+    return cfg.hideEmpty && !lone ? all.filter((g) => g.rows.length > 0 || (g.message && g.message !== cfg.emptyText)) : all;
+  }, [sections, lone, cfg, now]);
+
   const fontPx = (Number(style.fontSize) || 22) * cfg.textScale;
+  const url = source ? (source.kind === 'account' ? source.url : source.urls[0]) : '';
 
   let notice: { title: string; detail?: string } | null = null;
-  if (parsed === 'empty') notice = { title: 'Add a reminders list', detail: "Paste the list's Radicale address into this module's settings." };
-  else if (parsed === 'notALink') notice = { title: "That isn't a list address", detail: 'It should look like http://192.168.1.14:5232/family/household/' };
-  else if (parsed === 'loopback') notice = { title: "Use the Pi's network address, not localhost", detail: 'Home Screens only lets plugins reach Radicale by its LAN address, like http://192.168.1.14:5232/family/household/' };
-  else if (session && url && !list) notice = session.failure ? failureNotice(session.failure, url) : { title: 'Loading list…' };
+  if (parsed === 'empty') notice = { title: 'Add your reminders', detail: "Put the family account's address, like http://192.168.1.14:5232/family/, in this module's settings." };
+  else if (parsed === 'notALink') notice = { title: "That isn't a Radicale address", detail: 'It should look like http://192.168.1.14:5232/family/' };
+  else if (parsed === 'loopback') notice = { title: "Use the Pi's network address, not localhost", detail: 'Home Screens only lets plugins reach Radicale by its LAN address, like http://192.168.1.14:5232/family/' };
+  else if (session && !sections) notice = session.failure ? failureNotice(session.failure, url) : { title: 'Loading lists…' };
+  else if (sections && sections.length === 0) {
+    notice = cfg.onlyLists.length
+      ? { title: 'None of those lists were found', detail: `Looking for: ${cfg.onlyLists.join(', ')}. Names must match the phones (any capitalization).` }
+      : { title: 'No reminders lists yet', detail: 'Make one in the Reminders app under Home, and it shows up here.' };
+  } else if (lone && sections && !sections[0].list && sections[0].failure) notice = failureNotice(sections[0].failure, sections[0].info.url);
 
-  const title = cfg.title || list?.name || 'To-do';
-  const stale = !!(list && session?.failure);
+  // Not updated: the oldest good copy among the lists still showing one.
+  const failing = session && (session.failure || sections?.some((s) => s.failure && s.list));
+  const staleSince = failing && sections ? Math.min(...sections.filter((s) => s.list).map((s) => s.okAt)) : 0;
+  const staleNote = staleSince > 0 ? `Not updated since ${formatTime(wallClock(staleSince, tz).time, timeFormat)}` : undefined;
+
+  const ctx: RowContext = { cfg, today: wall.date, nowTime: wall.time, timeFormat };
+  const loneSection = lone && sections ? sections[0] : null;
+  const allEmpty = groups.length === 0 || groups.every((g) => g.rows.length === 0 && !g.message);
+  const topTitle = loneSection
+    ? cfg.title || loneSection.info.name || loneSection.list?.name || 'To-do'
+    : cfg.title;
 
   return (
     <div style={{ ...hostFrameStyle(style, { baseFontSize: 22 }) }}>
@@ -392,22 +524,24 @@ export default function RemindersList(props: PluginComponentProps & { fetcher?: 
         }}
       >
         {notice && <Notice {...notice} />}
-        {!notice && list && cfg.showHeader && (
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.6em', marginBottom: '0.3em', paddingBottom: '0.3em', borderBottom: `0.08em solid ${cfg.accentColor}` }}>
-            <div style={{ fontSize: '1.15em', fontWeight: 700, flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{title}</div>
-            {stale && session && (
-              <div style={{ fontSize: '0.7em', opacity: 0.7, whiteSpace: 'nowrap' }} title={session.failure?.kind}>
-                Not updated since {formatTime(wallClock(session.okAt, tz).time, timeFormat)}
-              </div>
-            )}
-            {openCount > 0 && <div style={{ fontSize: '0.8em', opacity: 0.75, whiteSpace: 'nowrap' }}>{openCount} to do</div>}
-          </div>
+        {!notice && cfg.showHeader && topTitle && (
+          <Heading
+            name={topTitle}
+            open={loneSection?.list ? loneSection.list.tasks.filter((t) => !t.done).length : 0}
+            color={loneSection ? groups[0]?.color ?? cfg.accentColor : cfg.accentColor}
+            size="1.15em"
+            note={staleNote}
+            gapBelow={loneSection ? '0.3em' : '0.6em'}
+          />
         )}
-        {!notice && list && rows.length === 0 && (
+        {!notice && (loneSection ? groups[0]?.rows.length === 0 : allEmpty) && (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: 0.7 }}>{cfg.emptyText}</div>
         )}
-        {!notice && list && rows.length > 0 && box.w > 0 && (
-          <TaskColumns rows={rows} ctx={{ cfg, today: wall.date, nowTime: wall.time, timeFormat }} fontPx={fontPx} box={box} />
+        {!notice && !(loneSection ? groups[0]?.rows.length === 0 : allEmpty) && box.w > 0 && (
+          <GroupColumns groups={groups} ctx={ctx} fontPx={fontPx} box={box} />
+        )}
+        {!notice && staleNote && !(cfg.showHeader && topTitle) && (
+          <div style={{ position: 'absolute', right: 0, bottom: 0, fontSize: '0.7em', opacity: 0.7 }}>{staleNote}</div>
         )}
       </div>
     </div>

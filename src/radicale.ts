@@ -57,6 +57,29 @@ export function parseListUrl(input: string): string | UrlProblem {
   return url.toString();
 }
 
+/** What the address setting asks for: every list in an account (an address
+ *  with one folder, `/family/`), or particular lists (two folders,
+ *  `/family/household/`), one or more separated by spaces, commas or new
+ *  lines. */
+export type Source =
+  | { kind: 'account'; url: string }
+  | { kind: 'lists'; urls: string[] };
+
+export function parseSource(input: string): Source | UrlProblem {
+  const parts = input.split(/[\s,]+/).filter(Boolean);
+  if (!parts.length) return 'empty';
+  const urls: string[] = [];
+  for (const p of parts) {
+    const u = parseListUrl(p);
+    if (u === 'empty') continue;
+    if (u === 'notALink' || u === 'loopback') return u;
+    urls.push(u);
+  }
+  const depth = (u: string) => new URL(u).pathname.split('/').filter(Boolean).length;
+  if (urls.length === 1 && depth(urls[0]) === 1) return { kind: 'account', url: urls[0] };
+  return { kind: 'lists', urls: [...new Set(urls)] };
+}
+
 /** UTF-8 safe, unlike a bare `btoa` on a password with an accent in it. */
 export function basicAuth(user: string, password: string): string {
   const bytes = new TextEncoder().encode(`${user}:${password}`);
@@ -74,6 +97,7 @@ export type Failure =
   | { kind: 'forbidden' } // the account may not read this list
   | { kind: 'notFound' } // no list at that address
   | { kind: 'notAList' } // an answer, but not an iCalendar file
+  | { kind: 'cantList' } // the browser couldn't ask Radicale for the account's lists (no CORS headers, or unreachable)
   | { kind: 'unexpected'; status: number };
 
 export class ListError extends Error {

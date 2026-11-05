@@ -5,11 +5,14 @@ import RemindersList from '../src/index';
 import { addDays } from '../src/tasks';
 import { wallClock } from '../src/ical';
 import type { Fetcher } from '../src/radicale';
+import type { DirectFetcher } from '../src/discover';
 import { makeHostDisplayCache } from './host-cache';
 
 // Stand-in for the host: just enough SDK for the module to run.
 // `?w=&h=` module size, `fs=` text size, `tz=`, `fail=1` to start with
-// Radicale unreachable, and any config key (`sortBy=due`, `keepDoneHours=6`).
+// Radicale unreachable, `nocors=1` for a Radicale without CORS headers, and
+// any config key (`listUrl=http://192.168.1.14:5232/family/household/` for
+// one list, `onlyLists=Groceries`, `sortBy=due`, `keepDoneHours=6`).
 const params = new URLSearchParams(location.search);
 const timezone = params.get('tz') ?? 'America/Chicago';
 (window as unknown as { React: typeof React }).React = React;
@@ -18,7 +21,7 @@ const timezone = params.get('tz') ?? 'America/Chicago';
   emit: (e: unknown) => console.info('[host emit]', e),
 };
 
-// ── A fake Radicale list, written the way the Reminders app writes it ──────
+// ── Fake Radicale lists, written the way the Reminders app writes them ─────
 
 const today = wallClock(Date.now(), timezone).date;
 const ymd = (days: number) => addDays(today, days).replace(/-/g, '');
@@ -44,18 +47,52 @@ let items: Item[] = [
   item('trash', 'Trash out', 'STATUS:COMPLETED', `COMPLETED:${stamp(Date.now() - 40 * 60_000)}`),
 ];
 
-const ics = () => [
-  'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//PYVOBJECT//NONSGML Version 0.9.9//EN', 'X-WR-CALNAME;VALUE=TEXT:Household',
-  ...items.flatMap((i) => ['BEGIN:VTODO', `UID:${i.uid}`, 'DTSTAMP:20261104T120000Z', ...i.lines, 'END:VTODO']),
+const groceries: Item[] = [
+  item('g1', 'Coffee beans'),
+  item('g2', 'Bananas'),
+  item('g3', 'Dish soap', 'PRIORITY:5'),
+  item('g4', 'Parmesan'),
+];
+
+const ACCOUNT = 'http://192.168.1.14:5232/family/';
+// As the phones made them: Household by the installer, the others in the
+// Reminders app, so with random folder names, colors and an order.
+const lists = [
+  { path: 'household/', name: 'Household', color: '#34C759FF', order: 1, items: () => items },
+  { path: '5C2E9A10-7B3D-4E21-9F00-1A2B3C4D5E6F/', name: 'Groceries', color: '#FF9500FF', order: 2, items: () => groceries },
+  { path: 'A41F0C2E-55D1-4B7A-8C3E-0F9E8D7C6B5A/', name: 'Packing', color: '#AF52DEFF', order: 3, items: () => [] as Item[] },
+];
+
+const ics = (name: string, list: Item[]) => [
+  'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//PYVOBJECT//NONSGML Version 0.9.9//EN', `X-WR-CALNAME;VALUE=TEXT:${name}`,
+  ...list.flatMap((i) => ['BEGIN:VTODO', `UID:${i.uid}`, 'DTSTAMP:20261104T120000Z', ...i.lines, 'END:VTODO']),
   'END:VCALENDAR', '',
 ].join('\r\n');
 
+const multistatus = () =>
+  `<?xml version='1.0' encoding='utf-8'?><multistatus xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:ICAL="http://apple.com/ns/ical/">` +
+  `<response><href>/family/</href><propstat><prop><resourcetype><principal /><collection /></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response>` +
+  lists.map((l) => `<response><href>/family/${l.path}</href><propstat><prop><resourcetype><C:calendar /><collection /></resourcetype>` +
+    `<displayname>${l.name}</displayname><C:supported-calendar-component-set><C:comp name="VTODO" /></C:supported-calendar-component-set>` +
+    `<ICAL:calendar-color>${l.color}</ICAL:calendar-color><ICAL:calendar-order>${l.order}</ICAL:calendar-order></prop>` +
+    `<status>HTTP/1.1 200 OK</status></propstat></response>`).join('') +
+  '</multistatus>';
+
+const LOGIN = `Basic ${btoa('display:preview')}`;
 let down = params.get('fail') === '1';
 const devFetcher: Fetcher = async (req) => {
   await new Promise((r) => setTimeout(r, 150));
   if (down) throw new Error('ECONNREFUSED');
-  if (req.headers?.Authorization !== `Basic ${btoa('display:preview')}`) return { status: 401, body: 'Access to the requested resource forbidden.' };
-  return { status: 200, body: ics() };
+  if (req.headers?.Authorization !== LOGIN) return { status: 401, body: 'Access to the requested resource forbidden.' };
+  const list = lists.find((l) => req.url === ACCOUNT + l.path);
+  return list ? { status: 200, body: ics(list.name, list.items()) } : { status: 404, body: 'The requested resource could not be found.' };
+};
+// The PROPFIND the module sends straight from the browser.
+const devDirect: DirectFetcher = async (req) => {
+  await new Promise((r) => setTimeout(r, 100));
+  if (down || params.get('nocors') === '1') throw new TypeError('Failed to fetch');
+  if (req.headers.Authorization !== LOGIN) return { status: 401, body: '' };
+  return { status: 207, body: multistatus() };
 };
 
 const style = {
@@ -65,11 +102,11 @@ const style = {
 };
 const config: Record<string, unknown> = {
   ...manifest.defaultConfig,
-  listUrl: 'http://192.168.1.14:5232/family/household/',
+  listUrl: ACCOUNT,
   password: 'preview',
   refreshSeconds: 15,
   keepDoneHours: 2,
-  ...Object.fromEntries([...params].filter(([k]) => !['w', 'h', 'fs', 'tz', 'fail'].includes(k))),
+  ...Object.fromEntries([...params].filter(([k]) => !['w', 'h', 'fs', 'tz', 'fail', 'nocors'].includes(k))),
 };
 
 /** The module at a size you can change, plus buttons that act like a phone. */
@@ -103,7 +140,7 @@ function Harness() {
         <span>{w}×{h}</span>
       </div>
       <div id="module" style={{ width: w, height: h, resize: 'both', overflow: 'hidden' }}>
-        <RemindersList key={mount} config={config} style={style} timezone={timezone} fetcher={devFetcher} />
+        <RemindersList key={mount} config={config} style={style} timezone={timezone} fetcher={devFetcher} direct={devDirect} />
       </div>
     </div>
   );

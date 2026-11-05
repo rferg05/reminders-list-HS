@@ -51,6 +51,15 @@ export function arrange(tasks: Task[], sortBy: SortBy, keepDoneMs: number, now: 
   return rows;
 }
 
+/** When lists don't all fit, which gives up a row next: the one showing
+ *  the most (the later one on a tie, so the first lists keep theirs). */
+export function trimOne(shown: number[]): number[] | null {
+  let at = -1;
+  shown.forEach((n, i) => { if (n > 0 && (at < 0 || n >= shown[at])) at = i; });
+  if (at < 0) return null;
+  return shown.map((n, i) => (i === at ? n - 1 : n));
+}
+
 // ── Due dates ───────────────────────────────────────────────────────────────
 
 export type DueTone = 'overdue' | 'today' | 'soon' | 'later';

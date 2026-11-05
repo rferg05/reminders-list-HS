@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import household from './fixtures/radicale-household.ics?raw';
+import propfind from './fixtures/radicale-propfind-family.xml?raw';
+import { chooseLists, discoverLists, normalizeColor, parseLists } from './discover';
+import type { DirectFetcher } from './discover';
 import { parseDue, parseLine, parseTaskList, unescapeText, unfold } from './ical';
 import type { Task } from './ical';
-import { basicAuth, parseListUrl } from './radicale';
-import { arrange, dueLabel, formatTime } from './tasks';
+import { basicAuth, ListError, parseListUrl, parseSource } from './radicale';
+import { arrange, dueLabel, formatTime, trimOne } from './tasks';
 
 const TZ = 'America/Chicago';
 
@@ -157,5 +160,88 @@ describe('the list address', () => {
 
   it('encodes passwords with accents', () => {
     expect(basicAuth('display', 'café')).toBe('Basic ZGlzcGxheTpjYWbDqQ==');
+  });
+});
+
+// Recorded from Radicale 3.9: a Depth 1 PROPFIND on the family account,
+// holding two reminders lists (one with the phone's color and order) and an
+// event calendar.
+describe("finding an account's lists", () => {
+  const ACCOUNT = 'http://192.168.1.14:5232/family/';
+  const lists = parseLists(propfind, ACCOUNT);
+
+  it('keeps reminders lists and skips the account and event calendars', () => {
+    expect(lists.map((l) => l.name).sort()).toEqual(['Groceries & more', 'Household']);
+  });
+
+  it('makes full addresses and reads color and order', () => {
+    const household = lists.find((l) => l.name === 'Household')!;
+    expect(household).toEqual({ url: 'http://192.168.1.14:5232/family/household/', name: 'Household', color: '#34c759', order: 1 });
+    const groceries = lists.find((l) => l.name.startsWith('Groceries'))!;
+    expect(groceries.url).toBe('http://192.168.1.14:5232/family/7F1C2A9E-1111-4C2B-9D3E-ABCDEF012345/');
+  });
+
+  it("ignores properties the server didn't have", () => {
+    const xml = propfind.replace('<ICAL:calendar-order>2</ICAL:calendar-order>', '');
+    expect(parseLists(xml, ACCOUNT).find((l) => l.name.startsWith('Groceries'))!.order).toBeNull();
+  });
+
+  it("orders lists the phone's way, or as named", () => {
+    const l = [
+      { url: 'a', name: 'Zed', color: null, order: null },
+      { url: 'b', name: 'Groceries', color: null, order: 2 },
+      { url: 'c', name: 'Household', color: null, order: 1 },
+      { url: 'd', name: 'Alpha', color: null, order: null },
+    ];
+    expect(chooseLists(l, []).map((x) => x.name)).toEqual(['Household', 'Groceries', 'Alpha', 'Zed']);
+    expect(chooseLists(l, ['zed', 'Household', 'Missing']).map((x) => x.name)).toEqual(['Zed', 'Household']);
+  });
+
+  it("turns Apple's RGBA colors into CSS ones", () => {
+    expect(normalizeColor('#FF9500FF')).toBe('#ff9500');
+    expect(normalizeColor('#1badf8')).toBe('#1badf8');
+    expect(normalizeColor('blue')).toBeNull();
+  });
+
+  it('sends a Depth 1 PROPFIND with the login and reads the answer', async () => {
+    let seen: Parameters<DirectFetcher>[0] | null = null;
+    const direct: DirectFetcher = async (req) => { seen = req; return { status: 207, body: propfind }; };
+    expect(await discoverLists(direct, ACCOUNT, 'display', 'pw')).toHaveLength(2);
+    expect(seen!.method).toBe('PROPFIND');
+    expect(seen!.headers.Depth).toBe('1');
+    expect(seen!.headers.Authorization).toBe(basicAuth('display', 'pw'));
+  });
+
+  it('reports a browser refusal (no CORS headers) apart from a wrong password', async () => {
+    const blocked: DirectFetcher = async () => { throw new TypeError('Failed to fetch'); };
+    await expect(discoverLists(blocked, ACCOUNT, 'display', 'pw')).rejects.toMatchObject({ failure: { kind: 'cantList' } });
+    const denied: DirectFetcher = async () => ({ status: 401, body: '' });
+    await expect(discoverLists(denied, ACCOUNT, 'display', 'pw')).rejects.toBeInstanceOf(ListError);
+  });
+});
+
+describe('the address setting', () => {
+  it('reads an account address as "every list"', () => {
+    expect(parseSource('http://192.168.1.14:5232/family')).toEqual({ kind: 'account', url: 'http://192.168.1.14:5232/family/' });
+  });
+
+  it('reads one or more list addresses', () => {
+    expect(parseSource('http://192.168.1.14:5232/family/household/')).toEqual({ kind: 'lists', urls: ['http://192.168.1.14:5232/family/household/'] });
+    expect(parseSource('192.168.1.14:5232/family/a/,\n 192.168.1.14:5232/family/b')).toEqual({
+      kind: 'lists', urls: ['http://192.168.1.14:5232/family/a/', 'http://192.168.1.14:5232/family/b/'],
+    });
+  });
+
+  it('passes on problems', () => {
+    expect(parseSource('')).toBe('empty');
+    expect(parseSource('http://localhost:5232/family/')).toBe('loopback');
+  });
+});
+
+describe('fitting several lists', () => {
+  it('trims the longest list first, the later one on a tie', () => {
+    expect(trimOne([5, 2, 5])).toEqual([5, 2, 4]);
+    expect(trimOne([1, 0])).toEqual([0, 0]);
+    expect(trimOne([0, 0])).toBeNull();
   });
 });

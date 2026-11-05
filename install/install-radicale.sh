@@ -6,6 +6,7 @@
 #   - one read-only "display" account for the Reminders List module
 #   - a list called Household, ready to use
 #   - LAN only, plain HTTP on port 5232
+#   - CORS headers, so the module can find every list in the family account
 #
 # Usage (on the Pi):
 #   sudo bash install-radicale.sh
@@ -37,7 +38,7 @@ warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -137,6 +138,15 @@ filesystem_folder = $STORAGE
 
 [web]
 type = internal
+
+# Lets the Reminders List module, running in the dashboard's browser, ask
+# for the family account's lists (a PROPFIND, which Home Screens' own proxy
+# won't pass). Every request still needs a password.
+[headers]
+Access-Control-Allow-Origin = *
+Access-Control-Allow-Methods = GET, PROPFIND, OPTIONS
+Access-Control-Allow-Headers = Authorization, Depth, Content-Type
+Access-Control-Max-Age = 600
 EOF
 
 backup "$RIGHTS_FILE"
@@ -215,6 +225,7 @@ curl -s -o /dev/null "http://127.0.0.1:$PORT/" || die "Radicale didn't start. Se
 # ── The starter list ─────────────────────────────────────────────────────────
 
 LIST_URL="http://$PI_IP:$PORT/$FAMILY_USER/$LIST_SLUG/"
+ACCOUNT_URL="http://$PI_IP:$PORT/$FAMILY_USER/"
 LOCAL_LIST="http://127.0.0.1:$PORT/$FAMILY_USER/$LIST_SLUG/"
 
 step "Creating the $LIST_NAME list"
@@ -276,12 +287,13 @@ Radicale is running at http://$PI_IP:$PORT/  (web page: http://$PI_IP:$PORT/.web
    The "$LIST_NAME" list appears in Reminders under "Home".
 
 2. In the Home Screens editor, add a Reminders List module and set
-     List address: $LIST_URL
+     Address:      $ACCOUNT_URL   (every list under Home)
+                   or $LIST_URL   (just $LIST_NAME)
      User name:    $DISPLAY_USER
      $DISPLAY_LINE
 
-Lists made on a phone under "Home" are shared too. Their addresses are on
-the web page above (sign in as $FAMILY_USER).
+Lists made on a phone under "Home" are shared too, and show up on the
+dashboard by themselves when the module uses the account address.
 EOF
 chmod 600 "$NOTES"
 

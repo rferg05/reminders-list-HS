@@ -7,8 +7,11 @@ export interface Config {
   listUrl: string;
   username: string;
   password: string;
+  onlyLists: string[];
   title: string;
   showHeader: boolean;
+  listColors: boolean;
+  hideEmpty: boolean;
   sortBy: SortBy;
   showDue: boolean;
   showNotes: boolean;
@@ -40,8 +43,11 @@ export function readConfig(raw: Record<string, unknown>): Config {
     listUrl: str(raw.listUrl, '').trim(),
     username: str(raw.username, 'display').trim(),
     password: str(raw.password, ''),
+    onlyLists: str(raw.onlyLists, '').split(',').map((s) => s.trim()).filter(Boolean),
     title: str(raw.title, '').trim(),
     showHeader: bool(raw.showHeader, true),
+    listColors: bool(raw.listColors, true),
+    hideEmpty: bool(raw.hideEmpty, false),
     sortBy: pick(raw.sortBy, ['phone', 'due'] as const, 'phone'),
     showDue: bool(raw.showDue, true),
     showNotes: bool(raw.showNotes, false),
