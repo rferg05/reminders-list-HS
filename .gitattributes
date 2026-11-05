@@ -1,0 +1,2 @@
+*.ics -text
+*.sh text eol=lf

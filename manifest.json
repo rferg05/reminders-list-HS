@@ -1,0 +1,173 @@
+{
+  "id": "reminders-list",
+  "name": "Reminders List",
+  "version": "1.0.0",
+  "description": "A shared to-do list that everyone edits in the iPhone Reminders app. The list lives in Radicale on the Pi, and the module shows it large enough to read across the room.",
+  "author": "Ryan",
+  "license": "MIT",
+  "minAppVersion": "1.13.0",
+  "moduleType": "reminders-list",
+  "category": "Information",
+  "icon": "list-checks",
+  "defaultConfig": {
+    "listUrl": "",
+    "username": "display",
+    "password": "",
+    "title": "",
+    "showHeader": true,
+    "sortBy": "phone",
+    "showDue": true,
+    "showNotes": false,
+    "showPriority": true,
+    "keepDoneHours": 0,
+    "columns": "auto",
+    "textScale": 1,
+    "accentColor": "#f59e0b",
+    "emptyText": "All done",
+    "timeFormat": "auto",
+    "refreshSeconds": 60
+  },
+  "defaultSize": {
+    "w": 520,
+    "h": 640
+  },
+  "defaultStyle": {
+    "fontSize": 22,
+    "padding": 16,
+    "borderRadius": 12,
+    "backgroundColor": "rgba(0, 0, 0, 0.35)"
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "listUrl": {
+        "type": "string",
+        "title": "List address",
+        "description": "The list's address in Radicale, with the Pi's network address rather than localhost, e.g. http://192.168.1.14:5232/family/household/. The installer prints it.",
+        "ui:widget": "text",
+        "ui:group": "List"
+      },
+      "username": {
+        "type": "string",
+        "title": "User name",
+        "description": "The read-only account the installer made for the dashboard.",
+        "ui:widget": "text",
+        "ui:group": "List"
+      },
+      "password": {
+        "type": "string",
+        "title": "Password",
+        "description": "The display account's password, printed by the installer. It can only read lists, never change them.",
+        "ui:widget": "text",
+        "ui:group": "List"
+      },
+      "refreshSeconds": {
+        "type": "number",
+        "title": "Check for changes every (seconds)",
+        "minimum": 15,
+        "maximum": 900,
+        "ui:widget": "slider",
+        "ui:step": 15,
+        "ui:group": "List"
+      },
+      "title": {
+        "type": "string",
+        "title": "Heading",
+        "description": "Leave empty to use the list's name from the phones.",
+        "ui:widget": "text",
+        "ui:group": "Display"
+      },
+      "showHeader": {
+        "type": "boolean",
+        "title": "Show heading",
+        "ui:widget": "toggle",
+        "ui:group": "Display"
+      },
+      "sortBy": {
+        "type": "string",
+        "title": "Order",
+        "description": "Phone order follows the order items are dragged into in Reminders; items it has no order for go by when they were added.",
+        "enum": ["phone", "due"],
+        "enumLabels": ["Same as on the phones", "Due soonest first"],
+        "ui:widget": "select",
+        "ui:group": "Display"
+      },
+      "columns": {
+        "type": "string",
+        "title": "Columns",
+        "description": "Auto adds a second or third column only when the list doesn't fit in one, and the module is wide enough.",
+        "enum": ["auto", "1", "2", "3"],
+        "enumLabels": ["Auto", "1", "2", "3"],
+        "ui:widget": "select",
+        "ui:group": "Display"
+      },
+      "showDue": {
+        "type": "boolean",
+        "title": "Due dates",
+        "description": "\"Today 5p\", \"Tomorrow\", \"Fri\". Overdue ones are red.",
+        "ui:widget": "toggle",
+        "ui:group": "Details"
+      },
+      "showPriority": {
+        "type": "boolean",
+        "title": "Priority marks (!, !!, !!!)",
+        "ui:widget": "toggle",
+        "ui:group": "Details"
+      },
+      "showNotes": {
+        "type": "boolean",
+        "title": "First line of notes",
+        "ui:widget": "toggle",
+        "ui:group": "Details"
+      },
+      "keepDoneHours": {
+        "type": "number",
+        "title": "Keep checked-off items for (hours)",
+        "description": "Shown crossed out at the bottom, so everyone sees what got done. 0 hides them at once.",
+        "minimum": 0,
+        "maximum": 48,
+        "ui:widget": "slider",
+        "ui:step": 1,
+        "ui:group": "Details"
+      },
+      "emptyText": {
+        "type": "string",
+        "title": "When the list is empty, show",
+        "ui:widget": "text",
+        "ui:group": "Details"
+      },
+      "textScale": {
+        "type": "number",
+        "title": "Text size",
+        "description": "On top of the Style panel's Text size. Larger fits fewer items.",
+        "minimum": 0.5,
+        "maximum": 2.5,
+        "ui:widget": "slider",
+        "ui:step": 0.05,
+        "ui:group": "Legibility"
+      },
+      "accentColor": {
+        "type": "string",
+        "title": "Accent color",
+        "description": "Checkboxes, the heading underline, priority marks and things due today.",
+        "ui:widget": "color",
+        "ui:group": "Legibility"
+      },
+      "timeFormat": {
+        "type": "string",
+        "title": "Clock times",
+        "enum": ["auto", "12h", "24h"],
+        "enumLabels": ["Household setting", "12-hour", "24-hour"],
+        "ui:widget": "select",
+        "ui:group": "Legibility"
+      }
+    }
+  },
+  "allowedDomains": ["*"],
+  "exports": {
+    "component": "default"
+  },
+  "dataRequirements": [],
+  "prefetchUrl": null,
+  "permissions": ["network", "localNetwork"]
+}
